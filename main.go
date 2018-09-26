@@ -17,25 +17,70 @@ limitations under the License.
 package main
 
 import (
-	"flag"
-	"os"
-
-	"github.com/golang/glog"
-
+	"github.com/dpanayotov/sample-apiserver/apiserver"
+	"github.com/dpanayotov/sample-apiserver/pkg/postgres"
+	_ "github.com/lib/pq"
+	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	genericapiserver "k8s.io/apiserver/pkg/server"
-	"k8s.io/apiserver/pkg/util/logs"
-	"k8s.io/sample-apiserver/pkg/cmd/server"
+	genericoptions "k8s.io/apiserver/pkg/server/options"
+	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
+)
+
+const GroupName = "service.manager.io"
+const defaultEtcdPathPrefix = "/registry/wardle.kubernetes.io"
+
+var (
+	Scheme = runtime.NewScheme()
+	Codecs = serializer.NewCodecFactory(Scheme)
+
+	SchemeGroupVersion = schema.GroupVersion{Group: GroupName, Version: runtime.APIVersionInternal}
 )
 
 func main() {
-	logs.InitLogs()
-	defer logs.FlushLogs()
+	factory.Register("postgres", postgres.NewPostgresStorage(), postgres.NewPostgresHealthCheck())
+	postgres.Register("postgres", NewPostgreSQL())
 
-	stopCh := genericapiserver.SetupSignalHandler()
-	options := server.NewWardleServerOptions(os.Stdout, os.Stderr)
-	cmd := server.NewCommandStartWardleServer(options, stopCh)
-	cmd.Flags().AddGoFlagSet(flag.CommandLine)
+	recommendedOptions := genericoptions.NewRecommendedOptions(defaultEtcdPathPrefix, apiserver.Codecs.LegacyCodec(SchemeGroupVersion))
+	serverConfig := genericapiserver.NewRecommendedConfig(apiserver.Codecs)
+	if err := recommendedOptions.ApplyTo(serverConfig, apiserver.Scheme); err != nil {
+		panic(err)
+	}
+	complete := serverConfig.Complete()
+	cmd := &cobra.Command{
+		Short: "Launch a wardle API server",
+		Long:  "Launch a wardle API server",
+		RunE: func(c *cobra.Command, args []string) error {
+			server, err := complete.New("sample-apiserver", genericapiserver.NewEmptyDelegate())
+			if err != nil {
+				return err
+			}
+
+			stopCh := make(chan struct{})
+			if err := server.PrepareRun().Run(stopCh); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+
+	flags := cmd.Flags()
+	recommendedOptions.AddFlags(flags)
+
 	if err := cmd.Execute(); err != nil {
-		glog.Fatal(err)
+		panic(err)
+	}
+}
+
+func NewPostgreSQL() *Generic {
+	return &Generic{
+		CleanupSQL: "delete from key_value where ttl > 0 and ttl < ?",
+		GetSQL:     "select name, value, revision from key_value where name = ?",
+		ListSQL:    "select name, value, revision from key_value where name like ?",
+		CreateSQL:  "insert into key_value(name, value, revision, ttl) values(?, ?, 1, ?)",
+		DeleteSQL:  "delete from key_value where name = ? and revision = ?",
+		UpdateSQL:  "update key_value set value = ?, revision = ? where name = ? and revision = ?",
 	}
 }
